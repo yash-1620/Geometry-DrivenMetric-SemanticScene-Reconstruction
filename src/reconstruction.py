@@ -1,241 +1,208 @@
 """
-3D Reconstruction via multi-view feature matching and triangulation.
-Builds a sparse 3D point cloud from SIFT features across multiple posed views.
+reconstruction.py  —  CP260-2026 Final Project
+Sparse Structure-from-Motion reconstruction using SIFT + BFMatcher + DLT.
+
+Pipeline
+--------
+1. Extract SIFT features from all loaded images.
+2. Match features across all image pairs (Lowe ratio test).
+3. Triangulate matched keypoints using the provided camera poses.
+4. Filter by positive depth + reprojection error threshold.
+5. Save result as ASCII PLY point cloud.
 """
+
 import cv2
 import numpy as np
 from itertools import combinations
 from tqdm import tqdm
+
+from .data_loader import get_projection_matrix
 from . import config
-from .data_loader import get_projection_matrix, get_scaled_intrinsics
 
 
-def extract_features(images, n_features=None, scale=None):
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_features(images):
     """
-    Extract SIFT features from all images.
+    Extract SIFT keypoints and descriptors from every loaded image.
 
     Args:
-        images: dict {frame_idx: BGR image}
-        n_features: max features per image
-        scale: resize factor for feature extraction
+        images   : dict  {frame_idx: BGR numpy array}
 
     Returns:
-        features: dict {frame_idx: (keypoints, descriptors)}
+        features : dict  {frame_idx: (keypoints, descriptors)}
     """
-    if n_features is None:
-        n_features = config.SIFT_N_FEATURES
-    if scale is None:
-        scale = config.SCALE_FACTOR
-
-    sift = cv2.SIFT_create(nfeatures=n_features)
+    sift     = cv2.SIFT_create(nfeatures=config.SIFT_N_FEATURES)
     features = {}
 
-    for idx, img in tqdm(images.items(), desc="  Extracting SIFT features"):
-        if scale != 1.0:
-            img_scaled = cv2.resize(img, None, fx=scale, fy=scale)
-        else:
-            img_scaled = img
+    for idx, img in tqdm(images.items(), desc="Extracting SIFT"):
+        gray          = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        kp, des       = sift.detectAndCompute(gray, None)
+        features[idx] = (kp, des)
 
-        gray = cv2.cvtColor(img_scaled, cv2.COLOR_BGR2GRAY)
-        kps, descs = sift.detectAndCompute(gray, None)
-
-        # Scale keypoints back to original image coordinates
-        if scale != 1.0:
-            for kp in kps:
-                kp.pt = (kp.pt[0] / scale, kp.pt[1] / scale)
-
-        features[idx] = (kps, descs)
-
+    print(f"[SfM] Features extracted from {len(features)} images")
     return features
 
 
-def match_features(features, ratio_thresh=None):
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature matching
+# ─────────────────────────────────────────────────────────────────────────────
+
+def match_features(features):
     """
-    Match SIFT features between all pairs of images.
+    Match SIFT descriptors across every image pair using brute-force L2
+    distance and Lowe's ratio test.
+
+    Args:
+        features : dict  {frame_idx: (keypoints, descriptors)}
 
     Returns:
-        matches: dict {(idx1, idx2): list of DMatch}
+        matches  : dict  {(frame_i, frame_j): list[cv2.DMatch]}
+                   Only pairs with >= 30 good matches are kept.
     """
-    if ratio_thresh is None:
-        ratio_thresh = config.MATCH_RATIO_THRESH
-
-    bf = cv2.BFMatcher(cv2.NORM_L2)
-    frame_indices = sorted(features.keys())
+    bf      = cv2.BFMatcher(cv2.NORM_L2)
     matches = {}
+    keys    = sorted(features.keys())
 
-    pairs = list(combinations(frame_indices, 2))
-    for idx1, idx2 in tqdm(pairs, desc="  Matching feature pairs"):
-        _, desc1 = features[idx1]
-        _, desc2 = features[idx2]
+    for i, j in combinations(keys, 2):
+        _, des1 = features[i]
+        _, des2 = features[j]
 
-        if desc1 is None or desc2 is None:
-            continue
-        if len(desc1) < 2 or len(desc2) < 2:
+        if des1 is None or des2 is None:
             continue
 
-        raw_matches = bf.knnMatch(desc1, desc2, k=2)
+        raw  = bf.knnMatch(des1, des2, k=2)
+        good = [m for m, n in raw
+                if m.distance < config.MATCH_RATIO_THRESH * n.distance]
 
-        # Lowe's ratio test
-        good = []
-        for m_pair in raw_matches:
-            if len(m_pair) == 2:
-                m, n = m_pair
-                if m.distance < ratio_thresh * n.distance:
-                    good.append(m)
+        if len(good) >= 30:
+            matches[(i, j)] = good
 
-        if len(good) >= 10:
-            matches[(idx1, idx2)] = good
-
-    print(f"  Found {len(matches)} valid image pairs")
+    print(f"[SfM] Matched pairs: {len(matches)}")
     return matches
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Triangulation
+# ─────────────────────────────────────────────────────────────────────────────
+
 def triangulate_matches(features, matches, poses, K):
     """
-    Triangulate 3D points from matched features using known camera poses.
+    Triangulate all matched keypoint pairs to obtain world-space 3-D points.
+
+    A point is accepted only when:
+      * it lies in front of both cameras  (positive depth)
+      * reprojection error < config.TRIANGULATION_REPROJ_THRESH in both views
 
     Args:
-        features: dict {frame_idx: (keypoints, descriptors)}
-        matches: dict {(idx1, idx2): list of DMatch}
-        poses: dict {frame_idx: 4x4 c2w matrix}
-        K: 3x3 intrinsic matrix
+        features : dict  {frame_idx: (keypoints, descriptors)}
+        matches  : dict  {(frame_i, frame_j): list[cv2.DMatch]}
+        poses    : dict  {frame_idx: (4,4) camera-to-world matrix}
+        K        : (3,3) camera intrinsic matrix
 
     Returns:
-        points_3d: (N, 3) array of 3D world points
-        colors: (N, 3) array of BGR colors
+        points_3d : (N, 3) float64 array  — accepted world-space points
+        None      : colour placeholder kept for API compatibility
     """
-    all_points = []
-    all_colors = []
+    points        = []
     reproj_thresh = config.TRIANGULATION_REPROJ_THRESH
 
-    for (idx1, idx2), match_list in tqdm(matches.items(),
-                                          desc="  Triangulating"):
-        if idx1 not in poses or idx2 not in poses:
+    for (i, j), match_list in tqdm(matches.items(), desc="Triangulating"):
+        if i not in poses or j not in poses:
             continue
 
-        kps1, _ = features[idx1]
-        kps2, _ = features[idx2]
+        kp1, _ = features[i]
+        kp2, _ = features[j]
 
-        P1 = get_projection_matrix(K, poses[idx1])
-        P2 = get_projection_matrix(K, poses[idx2])
+        P1 = get_projection_matrix(K, poses[i])
+        P2 = get_projection_matrix(K, poses[j])
 
-        pts1 = np.array([kps1[m.queryIdx].pt for m in match_list],
+        pts1 = np.array([kp1[m.queryIdx].pt for m in match_list],
                         dtype=np.float64)
-        pts2 = np.array([kps2[m.trainIdx].pt for m in match_list],
+        pts2 = np.array([kp2[m.trainIdx].pt for m in match_list],
                         dtype=np.float64)
 
-        # Triangulate
-        pts4d = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)  # (4, N)
-        pts3d = (pts4d[:3] / pts4d[3:]).T  # (N, 3)
+        pts4d = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
+        pts3d = (pts4d[:3] / pts4d[3]).T
 
-        # Filter by reprojection error
-        for i, pt3d in enumerate(pts3d):
-            pt_h = np.append(pt3d, 1.0)
+        for k, pt in enumerate(pts3d):
+            if not np.isfinite(pt).all():
+                continue
 
-            # Reproject to view 1
+            pt_h  = np.append(pt, 1.0)
             proj1 = P1 @ pt_h
-            if proj1[2] <= 0:
-                continue
-            proj1_2d = proj1[:2] / proj1[2]
-            err1 = np.linalg.norm(proj1_2d - pts1[i])
-
-            # Reproject to view 2
             proj2 = P2 @ pt_h
-            if proj2[2] <= 0:
+
+            # Reject points behind either camera
+            if proj1[2] <= 0 or proj2[2] <= 0:
                 continue
-            proj2_2d = proj2[:2] / proj2[2]
-            err2 = np.linalg.norm(proj2_2d - pts2[i])
+
+            err1 = np.linalg.norm(proj1[:2] / proj1[2] - pts1[k])
+            err2 = np.linalg.norm(proj2[:2] / proj2[2] - pts2[k])
 
             if err1 < reproj_thresh and err2 < reproj_thresh:
-                all_points.append(pt3d)
-                # Use color from first image (no need to load here, use white)
-                all_colors.append([200, 200, 200])
+                points.append(pt)
 
-    if len(all_points) == 0:
-        print("  [WARN] No points triangulated!")
-        return np.zeros((0, 3)), np.zeros((0, 3))
+    if not points:
+        print("[SfM] WARNING: no 3D points survived filtering")
+        return np.zeros((0, 3)), None
 
-    points_3d = np.array(all_points)
-    colors = np.array(all_colors, dtype=np.uint8)
-
-    print(f"  Triangulated {len(points_3d)} 3D points")
-    return points_3d, colors
+    return np.array(points), None
 
 
-def filter_point_cloud(points_3d, colors=None, voxel_size=None,
-                        sor_neighbors=None, sor_std=None):
-    """
-    Filter and clean a point cloud using voxel downsampling and
-    statistical outlier removal.
-    """
-    import open3d as o3d
-
-    if voxel_size is None:
-        voxel_size = config.VOXEL_SIZE
-    if sor_neighbors is None:
-        sor_neighbors = config.SOR_NB_NEIGHBORS
-    if sor_std is None:
-        sor_std = config.SOR_STD_RATIO
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_3d)
-    if colors is not None and len(colors) == len(points_3d):
-        pcd.colors = o3d.utility.Vector3dVector(colors.astype(float) / 255.0)
-
-    # Voxel downsampling
-    pcd_down = pcd.voxel_down_sample(voxel_size)
-
-    # Statistical outlier removal
-    pcd_clean, _ = pcd_down.remove_statistical_outlier(
-        nb_neighbors=sor_neighbors, std_ratio=sor_std
-    )
-
-    points_out = np.asarray(pcd_clean.points)
-    colors_out = (np.asarray(pcd_clean.colors) * 255).astype(np.uint8) \
-        if pcd_clean.has_colors() else None
-
-    print(f"  Filtered: {len(points_3d)} → {len(points_out)} points")
-    return points_out, colors_out
-
-
-def save_point_cloud(points_3d, colors, path):
-    """Save point cloud as PLY file using Open3D."""
-    import open3d as o3d
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_3d)
-    if colors is not None:
-        pcd.colors = o3d.utility.Vector3dVector(colors.astype(float) / 255.0)
-
-    o3d.io.write_point_cloud(path, pcd)
-    print(f"  Saved point cloud to {path} ({len(points_3d)} points)")
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Top-level entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_sparse_reconstruction(images, poses, K):
     """
-    Full sparse reconstruction pipeline.
+    Run the complete sparse SfM pipeline on a set of posed images.
+
+    Args:
+        images : dict  {frame_idx: BGR image}
+        poses  : dict  {frame_idx: (4,4) camera-to-world matrix}
+        K      : (3,3) intrinsic matrix
 
     Returns:
-        points_3d: (N, 3) filtered 3D points
-        colors: (N, 3) point colors
-        features: extracted features dict
-        matches: feature matches dict
+        pts3d    : (N, 3) world-space point cloud
+        colors   : None  (not computed in this lightweight version)
+        features : raw feature dict (reusable downstream)
+        matches  : raw match dict
     """
-    print("\n=== Sparse 3D Reconstruction ===")
+    print("\n=== SfM Reconstruction ===")
 
-    # Extract features
-    features = extract_features(images)
+    features      = extract_features(images)
+    matches       = match_features(features)
+    pts3d, colors = triangulate_matches(features, matches, poses, K)
 
-    # Match features
-    matches = match_features(features)
+    print(f"[SfM] Total 3D points: {len(pts3d)}")
+    return pts3d, colors, features, matches
 
-    # Triangulate
-    points_3d, colors = triangulate_matches(features, matches, poses, K)
 
-    if len(points_3d) == 0:
-        return points_3d, colors, features, matches
+# ─────────────────────────────────────────────────────────────────────────────
+# PLY export
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Filter
-    points_3d, colors = filter_point_cloud(points_3d, colors)
+def save_point_cloud(points, colors, path):
+    """
+    Write a point cloud to an ASCII PLY file.
 
-    return points_3d, colors, features, matches
+    Args:
+        points : (N, 3) XYZ coordinates
+        colors : ignored — kept for API compatibility
+        path   : destination file path (str)
+    """
+    with open(path, "w") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(points)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("end_header\n")
+        for p in points:
+            f.write(f"{p[0]:.8f} {p[1]:.8f} {p[2]:.8f}\n")
+
+    print(f"[SfM] Saved: {path}")

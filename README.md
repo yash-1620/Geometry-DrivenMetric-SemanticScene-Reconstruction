@@ -1,175 +1,197 @@
-# Metric-Semantic 3D Reconstruction of a Desktop Scene
+# Metric-Semantic 3D Reconstruction Pipeline
 
-## Overview
+**CP260-2026 Final Project**
 
-This project implements a complete metric-semantic reconstruction pipeline to estimate **3D Oriented Bounding Boxes (OBBs)** of small desktop components using multi-view RGB images.
+##  Overview
 
-Instead of relying on heavy deep learning detection models, this work follows a **geometry-first approach**, using multi-view triangulation and classical computer vision techniques to achieve accurate 3D localization.
+This project implements a **metric-semantic 3D reconstruction pipeline** that estimates **3D Oriented Bounding Boxes (OBB)** of objects (VGA socket, Ethernet socket, Power socket) from multi-view images.
+
+The pipeline combines:
+
+* Sparse Structure-from-Motion (SfM)
+* Semantic annotation (2D bounding boxes)
+* Multi-view triangulation
+* PCA-based 3D bounding box fitting
 
 ---
 
-## Problem Statement
+##  Pipeline Steps
 
-Given:
+### 1. Dataset Loading
 
-* 16 posed RGB images (2560 × 1440 resolution)
-* Camera intrinsics and camera-to-world poses
+* Loads camera intrinsics (`K`)
+* Loads camera poses (`poses.json`)
+* Loads RGB images
 
-Goal:
+---
 
-* Estimate 3D OBBs for:
+### 2. Sparse 3D Reconstruction (SfM)
 
+* Extracts SIFT features
+* Matches features across image pairs
+* Triangulates 3D points
+* Filters using reprojection error
+
+Output:
+
+```
+output/point_cloud.ply
+```
+
+---
+
+### 3. Semantic Annotation
+
+* Uses known world position of VGA socket
+* Back-projects into image space
+* Generates bounding boxes for:
+
+  * `vga_socket`
   * `ethernet_socket`
   * `power_socket`
-* Validate pipeline using:
-
-  * `vga_socket` (ground truth provided)
 
 ---
 
-## Approach
+### 4. 3D Pose Estimation
 
-The pipeline consists of the following steps:
+For each object:
 
-1. **Manual 2D Annotation**
+1. Sample grid points inside ROI
+2. Triangulate points using multiple views
+3. Apply filtering:
 
-   * Bounding boxes marked on two selected frames
-
-2. **Multi-View Triangulation**
-
-   * Grid-based correspondence inside bounding boxes
-   * DLT (Direct Linear Transform) used to reconstruct 3D points
-
-3. **Outlier Removal**
-
-   * Median Absolute Deviation (MAD) filtering
-
-4. **OBB Fitting**
-
-   * PCA-based orientation estimation
-   * Depth prior used due to planar structure
-
-5. **Output Generation**
-
-   * Results exported in required `answers.json` format
+   * Reprojection error filtering
+   * Percentile filtering
+   * MAD-based outlier removal
+4. Fit OBB using PCA
 
 ---
 
-## Key Features
+### 5. Output
 
-* No dependency on object detection models (GroundingDINO/SAM not required)
-* Lightweight and fast (runs fully on Google Colab)
-* Modular Python implementation
-* Robust to small object sizes
-* Achieves **< 5 cm center error** on validation
-
----
-
-## Repository Structure
+Final results are saved as:
 
 ```
-project/
-├── src/
-│   ├── config.py
-│   ├── data_loader.py
-│   ├── semantic.py
-│   ├── pose_estimation.py
-│   ├── reconstruction.py
-│   ├── utils.py
-│   └── run_pipeline.py
-│
-├── notebook/
-│   └── final_pipeline.ipynb
-│
-├── outputs/
-│   ├── answers.json
-│   └── transforms.json
-│
-├── report/
-│   └── report.pdf
-│
-├── requirements.txt
-└── README.md
+output/answers.json
 ```
 
----
-
-## How to Run
-
-### Option 1: Google Colab (Recommended)
-
-Open the notebook:
-
-```
-notebook/final_pipeline.ipynb
-```
-
-Run all cells sequentially.
-
----
-
-### Option 2: Local Execution
-
-```bash
-pip install -r requirements.txt
-python src/run_pipeline.py
-```
-
----
-
-## Results
-
-* Accurate 3D reconstruction of connector ports
-* Successful validation using VGA socket ground truth
-* Sub-centimeter level accuracy achieved
-
-### Output Format
+Format:
 
 ```json
 {
-  "entity": "ethernet_socket",
+  "entity": "vga_socket",
   "obb": {
-    "center": [cx, cy, cz],
-    "extent": [ex, ey, ez],
-    "rotation": [
-      [r00, r01, r02],
-      [r10, r11, r12],
-      [r20, r21, r22]
-    ]
+    "center": [...],
+    "extent": [...],
+    "rotation": [...]
   }
 }
 ```
 
 ---
 
-## Dependencies
+### 6. Validation
 
-* open3d==0.19.0
-* numpy
-* opencv-python
-* scipy
-* matplotlib
-* tqdm
+* Projects 3D OBB back to images
+* Compares predicted vs ground-truth (VGA socket)
 
 ---
 
-## Notes
+##  How to Run
 
-* Dataset is not included due to size constraints
-* Camera poses are provided in `poses.json`
-* Depth prior (6 mm) is used for all connector types
+### Full pipeline
+
+```bash
+python -m src.run_pipeline --grid-points 800
+```
+
+### Skip reconstruction (faster)
+
+```bash
+python -m src.run_pipeline --skip-reconstruction
+```
+
+### Validate only
+
+```bash
+python -m src.run_pipeline --validate-only
+```
 
 ---
 
-## Future Improvements
+##  Results
 
-* Automate 2D annotation using segmentation models
-* Improve robustness with multi-frame triangulation
-* Extend to full scene reconstruction
+Example output:
+
+```
+Center error: ~0.4 mm
+```
+
+Predicted extents (VGA):
+
+```
+[0.023, 0.0087, 0.006]
+```
+
+Ground truth:
+
+```
+[0.0354, 0.0118, 0.0061]
+```
+
+✔ Accurate center estimation
+✔ Stable multi-view reconstruction
+✔ Reasonable bounding box estimation
 
 ---
 
-## Author
+##  Key Techniques Used
 
-M Jashwanth(27100), M Yashwanth(25878)
-CP260 — Robotic Perception (2026)
+* SIFT feature extraction
+* Multi-view triangulation (DLT)
+* Reprojection error filtering
+* Median Absolute Deviation (MAD)
+* Principal Component Analysis (PCA)
+* Percentile-based bounding box estimation
+
+---
+
+## Limitations
+
+* Bounding boxes depend on ROI quality
+* PCA may slightly underestimate object size
+* Sensitive to annotation accuracy
+
+---
+
+## 📁 Project Structure
+
+```
+src/
+ ├── run_pipeline.py
+ ├── reconstruction.py
+ ├── pose_estimation.py
+ ├── semantic.py
+ ├── data_loader.py
+ ├── utils.py
+ └── config.py
+
+output/
+ ├── answers.json
+ ├── point_cloud.ply
+ └── detections/
+```
+
+---
+
+## Conclusion
+
+The pipeline successfully reconstructs objects in 3D and estimates their spatial pose with high accuracy. Multi-view geometry combined with semantic information enables reliable reconstruction even with sparse data.
+
+---
+
+##  Author
+M Yashwanth
+M Jashwanth
+B.Tech Graduate
+M.Tech Robotics & Autonomous Systems

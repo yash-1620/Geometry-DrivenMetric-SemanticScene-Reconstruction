@@ -193,5 +193,5 @@ The pipeline successfully reconstructs objects in 3D and estimates their spatial
 ##  Author
 M Yashwanth
 M Jashwanth
-B.Tech Graduate
-M.Tech Robotics & Autonomous Systems
+
+
